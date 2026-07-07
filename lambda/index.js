@@ -2,6 +2,7 @@ const { S3Client, GetObjectCommand, PutObjectCommand } = require("@aws-sdk/clien
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const { DynamoDBDocumentClient, PutCommand, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
 const sharp = require("sharp");
+const path = require("path");
 
 const s3 = new S3Client({});
 const ddbClient = new DynamoDBClient({});
@@ -9,6 +10,11 @@ const ddb = DynamoDBDocumentClient.from(ddbClient);
 
 const DYNAMODB_TABLE = process.env.DYNAMODB_TABLE;
 const PROCESSED_BUCKET = process.env.PROCESSED_BUCKET;
+
+// Pre-rendered "RRS" watermark PNG (generated where fonts are available).
+// Lambda's base runtime ships no fonts, so rendering SVG <text> at request
+// time produces invisible glyphs — compositing a raster image sidesteps that.
+const WATERMARK_PATH = path.join(__dirname, "assets", "watermark.png");
 
 exports.handler = async (event) => {
   const record = event.Records[0];
@@ -36,30 +42,31 @@ exports.handler = async (event) => {
     }));
     const imageBuffer = Buffer.concat(await original.Body.toArray());
 
-    // Step 3: get image dimensions so we can size the watermark correctly
-    const metadata = await sharp(imageBuffer).metadata();
-    const watermarkText = "RRS";
-    const fontSize = Math.max(24, Math.floor(metadata.width * 0.05));
-
-    const watermarkSvg = `
-      <svg width="${metadata.width}" height="${metadata.height}">
-        <text
-          x="${metadata.width - 20}"
-          y="${metadata.height - 20}"
-          font-family="Arial, sans-serif"
-          font-size="${fontSize}"
-          font-weight="bold"
-          fill="white"
-          fill-opacity="0.6"
-          text-anchor="end"
-        >${watermarkText}</text>
-      </svg>
-    `;
-
-    // Step 4: compress + watermark in one pipeline
-    const processedBuffer = await sharp(imageBuffer)
+    // Step 3: compress first, then size the watermark to match the resized image
+    const resizedBuffer = await sharp(imageBuffer)
       .resize({ width: 1600, withoutEnlargement: true })
-      .composite([{ input: Buffer.from(watermarkSvg), gravity: "southeast" }])
+      .toBuffer();
+    const resizedMetadata = await sharp(resizedBuffer).metadata();
+
+    // Step 4: scale the watermark to ~18% of the image width, with a margin
+    const margin = 20;
+    const watermarkWidth = Math.min(
+      Math.max(80, Math.floor(resizedMetadata.width * 0.18)),
+      resizedMetadata.width - margin * 2
+    );
+    const watermarkBuffer = await sharp(WATERMARK_PATH)
+      .resize({ width: watermarkWidth })
+      .toBuffer();
+    const watermarkMetadata = await sharp(watermarkBuffer).metadata();
+
+    // Step 5: watermark + encode
+    const processedBuffer = await sharp(resizedBuffer)
+      .composite([{
+        input: watermarkBuffer,
+        left: resizedMetadata.width - watermarkMetadata.width - margin,
+        top: resizedMetadata.height - watermarkMetadata.height - margin,
+      }])
+      .flatten({ background: { r: 255, g: 255, b: 255 } })
       .jpeg({ quality: 70 })
       .toBuffer();
 
